@@ -1,5 +1,5 @@
 """
-JPL Template Search — MCP Server
+JPL Template Search — MCP Server (v2)
 
 Connects Claude to the JPL template library stored in Pinecone.
 Deployed on Railway. Claude Teams connects via streamable HTTP transport.
@@ -7,6 +7,11 @@ Deployed on Railway. Claude Teams connects via streamable HTTP transport.
 Tools:
   jpl_search_templates  — Semantic search by natural language query
   jpl_get_template      — Retrieve full metadata for a specific template
+
+Changes from v1:
+  - jpl_get_template ID resolution: accepts base template_id without __primary suffix
+  - Improved metadata presentation in search results
+  - Better error messages and logging
 """
 
 import os
@@ -46,11 +51,6 @@ logger.info("API clients initialized (OpenAI + Pinecone index '%s')", PINECONE_I
 # MCP Server
 # ---------------------------------------------------------------------------
 
-# Railway's proxy forwards the public domain as the Host header.
-# The MCP SDK's DNS rebinding protection rejects any Host not on the
-# allowed list. We add Railway's domain so the proxy can reach us.
-# See: https://github.com/modelcontextprotocol/python-sdk/issues/1798
-
 RAILWAY_HOST = os.environ.get(
     "RAILWAY_PUBLIC_DOMAIN",
     "web-production-acfd4.up.railway.app"
@@ -88,15 +88,39 @@ def _build_filter(practice_area: str, document_type: str) -> dict:
     return f
 
 
+# Fields to include in search result summaries (lightweight, most useful for Claude)
+SEARCH_RESULT_FIELDS = [
+    "template_id", "template_name", "document_type", "practice_area",
+    "sub_practice_area", "template_tier", "quality_confidence",
+    "narrative_summary", "jpl_doc_type", "service_modality",
+    "negative_boundaries", "companion_documents", "vector_type",
+]
+
+
 def _format_results(matches) -> list[dict]:
-    """Convert Pinecone match objects to serializable dicts."""
+    """Convert Pinecone match objects to serializable dicts.
+
+    For search results, includes only the most useful metadata fields
+    to keep response sizes manageable. Use jpl_get_template for full metadata.
+    """
     results = []
     for m in matches:
-        results.append({
+        meta = m.metadata or {}
+
+        # Build a focused result with the most useful fields
+        result = {
             "score": round(m.score, 4),
-            "template_id": m.id,
-            "metadata": m.metadata or {}
-        })
+            "vector_id": m.id,
+            "template_id": meta.get("template_id", m.id.split("__")[0]),
+        }
+
+        # Include available search-relevant metadata fields
+        for field in SEARCH_RESULT_FIELDS:
+            if field in meta and field != "template_id":
+                result[field] = meta[field]
+
+        results.append(result)
+
     return results
 
 
@@ -127,6 +151,11 @@ async def jpl_search_templates(
     practice area, document type, narrative summary, quality confidence,
     template tier, and similarity scores.
 
+    Results may include matches from multiple vector types per template
+    (primary embeddings, HyPE hypothetical queries). The template_id field
+    links all vectors belonging to the same template. Use jpl_get_template
+    with the template_id to retrieve full metadata for any result.
+
     Args:
         query: Natural language description of the legal scenario or
                document need — e.g. "quiet title petition for a tax sale
@@ -140,19 +169,18 @@ async def jpl_search_templates(
 
     Returns:
         JSON object with result_count and an array of matching templates.
+        Each result includes a score, template_id, and key metadata fields.
+        Use jpl_get_template to retrieve the complete metadata for any template.
     """
     try:
-        # 1. Generate embedding from the query
         embed_response = openai_client.embeddings.create(
             model=EMBEDDING_MODEL,
             input=query,
         )
         query_vector = embed_response.data[0].embedding
 
-        # 2. Build optional metadata filter
         meta_filter = _build_filter(practice_area, document_type)
 
-        # 3. Query Pinecone
         query_kwargs: dict = {
             "vector": query_vector,
             "top_k": min(max(top_k, 1), 20),
@@ -163,7 +191,6 @@ async def jpl_search_templates(
 
         results = index.query(**query_kwargs)
 
-        # 4. Format and return
         formatted = _format_results(results.matches)
 
         if not formatted:
@@ -208,25 +235,41 @@ async def jpl_get_template(template_id: str) -> str:
     negative boundaries, companion documents, quality confidence, and all
     other metadata fields.
 
+    Accepts either the base template_id (e.g.
+    "curative-title-demand-letter-under-oklahoma-curative-act") or the
+    full Pinecone vector ID with suffix (e.g.
+    "curative-title-demand-letter-under-oklahoma-curative-act__primary").
+
     Args:
-        template_id: The template ID returned by jpl_search_templates.
+        template_id: The template ID — either the base ID from metadata
+                     or the full vector ID from search results.
 
     Returns:
         JSON object with the template's full metadata, or an error message
         if the ID is not found.
     """
     try:
-        result = index.fetch(ids=[template_id])
+        # Build candidate IDs to try
+        ids_to_try = [template_id]
 
-        if template_id in result.vectors:
-            vector_data = result.vectors[template_id]
-            return json.dumps({
-                "template_id": template_id,
-                "metadata": vector_data.metadata or {},
-            }, indent=2)
+        # If the ID doesn't already have a vector suffix, also try __primary
+        if "__" not in template_id:
+            ids_to_try.append(f"{template_id}__primary")
+
+        for candidate_id in ids_to_try:
+            result = index.fetch(ids=[candidate_id])
+
+            if candidate_id in result.vectors:
+                vector_data = result.vectors[candidate_id]
+                return json.dumps({
+                    "template_id": template_id.split("__")[0],
+                    "vector_id": candidate_id,
+                    "metadata": vector_data.metadata or {},
+                }, indent=2)
 
         return json.dumps({
             "error": f"Template '{template_id}' not found.",
+            "tried_ids": ids_to_try,
             "suggestion": "Use jpl_search_templates to find valid template IDs.",
         })
 
