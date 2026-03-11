@@ -15,6 +15,7 @@ import logging
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from openai import OpenAI
 from pinecone import Pinecone
 
@@ -45,7 +46,35 @@ logger.info("API clients initialized (OpenAI + Pinecone index '%s')", PINECONE_I
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("jpl_template_mcp", stateless_http=True)
+# Railway's proxy forwards the public domain as the Host header.
+# The MCP SDK's DNS rebinding protection rejects any Host not on the
+# allowed list. We add Railway's domain so the proxy can reach us.
+# See: https://github.com/modelcontextprotocol/python-sdk/issues/1798
+
+RAILWAY_HOST = os.environ.get(
+    "RAILWAY_PUBLIC_DOMAIN",
+    "web-production-acfd4.up.railway.app"
+)
+
+mcp = FastMCP(
+    "jpl_template_mcp",
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "localhost:*",
+            "127.0.0.1:*",
+            f"{RAILWAY_HOST}:*",
+            RAILWAY_HOST,
+        ],
+        allowed_origins=[
+            "http://localhost:*",
+            "https://localhost:*",
+            f"https://{RAILWAY_HOST}",
+            f"https://{RAILWAY_HOST}:*",
+        ],
+    ),
+)
 
 
 def _build_filter(practice_area: str, document_type: str) -> dict:
