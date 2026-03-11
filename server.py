@@ -13,6 +13,7 @@ import os
 import json
 import logging
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 from pinecone import Pinecone
@@ -44,7 +45,7 @@ logger.info("API clients initialized (OpenAI + Pinecone index '%s')", PINECONE_I
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("jpl_template_mcp")
+mcp = FastMCP("jpl_template_mcp", stateless_http=True)
 
 
 def _build_filter(practice_area: str, document_type: str) -> dict:
@@ -207,12 +208,17 @@ async def jpl_get_template(template_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ASGI app — used by uvicorn
+# ---------------------------------------------------------------------------
+
+app = mcp.streamable_http_app()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info("Starting JPL Template MCP server on port %d", port)
-    mcp.settings.host = "0.0.0.0"
-    mcp.settings.port = port
-    mcp.run(transport="streamable-http")
+    logger.info("Starting JPL Template MCP server on 0.0.0.0:%d", port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
