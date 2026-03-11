@@ -59,6 +59,7 @@ RAILWAY_HOST = os.environ.get(
 mcp = FastMCP(
     "jpl_template_mcp",
     stateless_http=True,
+    json_response=True,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=[
