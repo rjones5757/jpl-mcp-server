@@ -1,23 +1,50 @@
 """
-JPL Template Search — MCP Server (v2)
+JPL Template System — MCP Server (v4)
 
-Connects Claude to the JPL template library stored in Pinecone.
+Connects Claude to the JPL template library (Pinecone) and the JPL
+formatting macro service (Azure VM).
+
 Deployed on Railway. Claude Teams connects via streamable HTTP transport.
 
 Tools:
-  jpl_search_templates  — Semantic search by natural language query
-  jpl_get_template      — Retrieve full metadata for a specific template
+  jpl_search_templates    — Semantic search with deduplication, metadata
+                            hydration, and enriched evaluation metadata
+  jpl_get_template        — Retrieve full metadata for a specific template
+  apply_jpl_formatting    — Run the JPL formatting macro on a .docx file
+                            via the Azure VM macro service
 
-Changes from v1:
-  - jpl_get_template ID resolution: accepts base template_id without __primary suffix
-  - Improved metadata presentation in search results
-  - Better error messages and logging
+Changes from v3:
+  - jpl_search_templates now DEDUPLICATES by template_id — each template
+    appears once regardless of how many vectors matched, with best score
+    and a match_types array showing which vector types hit
+  - HyPE-only matches are HYDRATED with the primary vector's full metadata
+    via Pinecone fetch-by-ID (fast batch operation)
+  - Search response includes ENRICHED evaluation metadata (narrative_summary,
+    negative_boundaries, quality_confidence, distinctiveness_summary,
+    factual_scenario, companion_documents, etc.) enabling Claude-side
+    reranking without separate jpl_get_template calls
+  - Default top_k increased to 20 to support the two-stage
+    retrieve-and-rerank architecture
+  - New parameter: include_full_metadata (bool) for complete metadata
+  - jpl_get_template and apply_jpl_formatting unchanged from v3
+
+Dependencies (requirements.txt):
+  - mcp>=1.0.0
+  - openai>=1.0.0
+  - pinecone>=3.0.0
+  - uvicorn>=0.24.0
+  - httpx>=0.25.0
+  - box-sdk-gen
 """
 
 import os
+import io
 import json
 import logging
+import tempfile
+from pathlib import Path
 
+import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -30,6 +57,54 @@ from pinecone import Pinecone
 
 EMBEDDING_MODEL = "text-embedding-3-large"
 PINECONE_INDEX = "jpl-templates"
+
+# Macro API on the Azure VM
+VM_MACRO_URL = os.environ.get("VM_MACRO_URL", "")       # e.g. http://<VM-IP>:8080/format
+VM_MACRO_API_KEY = os.environ.get("VM_MACRO_API_KEY", "")
+
+# Box JWT config — stored as a JSON string in the Railway env var
+BOX_JWT_CONFIG = os.environ.get("BOX_JWT_CONFIG", "")
+
+# Box folder for macro output
+BOX_SKILLS_FOLDER = "365569381705"
+
+# Timeout for the macro API call
+MACRO_API_TIMEOUT = 120  # seconds
+
+# ---------------------------------------------------------------------------
+# Evaluation metadata fields — the subset Claude needs for intelligent triage.
+# These are returned by default in search results. Use include_full_metadata=true
+# for the complete 43+ field set.
+# ---------------------------------------------------------------------------
+
+EVALUATION_FIELDS = [
+    # Identity
+    "template_id",
+    "template_tier",
+    "document_type",
+    "practice_area",
+    "sub_practice_area",
+    "jpl_doc_type",
+    "service_modality",
+    # For scenario matching
+    "narrative_summary",
+    "factual_scenario",
+    "party_posture",
+    "complexity",
+    # For negative boundary triage
+    "negative_boundaries",
+    # For differentiation
+    "distinctiveness_summary",
+    "quality_confidence",
+    # For companion/set retrieval
+    "companion_documents",
+    # For presentation
+    "template_name",
+    "key_protective_provisions",
+    "advocacy_position",
+    "jurisdiction",
+    "property_type",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +121,178 @@ pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
 index = pc.Index(PINECONE_INDEX)
 
 logger.info("API clients initialized (OpenAI + Pinecone index '%s')", PINECONE_INDEX)
+
+# ---------------------------------------------------------------------------
+# Box client (lazy init — only created when the formatting tool is called)
+# ---------------------------------------------------------------------------
+
+_box_client = None
+
+
+def _get_box_client():
+    """Create or return the cached Box client.
+
+    Uses the BOX_JWT_CONFIG environment variable, which contains the full
+    JWT config JSON as a string (no file path needed on Railway).
+    """
+    global _box_client
+    if _box_client is not None:
+        return _box_client
+
+    if not BOX_JWT_CONFIG:
+        raise RuntimeError(
+            "BOX_JWT_CONFIG environment variable is not set. "
+            "Cannot connect to Box for file operations."
+        )
+
+    from box_sdk_gen import BoxClient, BoxJWTAuth, JWTConfig
+
+    jwt_config = JWTConfig.from_config_json_string(BOX_JWT_CONFIG)
+    auth = BoxJWTAuth(config=jwt_config)
+    _box_client = BoxClient(auth=auth)
+
+    user = _box_client.users.get_user_me()
+    logger.info("Box client initialized (authenticated as: %s)", user.name)
+    return _box_client
+
+
+def _box_download_file(file_id: str) -> tuple[bytes, str]:
+    """Download a file from Box. Returns (content_bytes, filename)."""
+    client = _get_box_client()
+    file_info = client.files.get_file_by_id(file_id)
+    content = client.downloads.download_file(file_id).read()
+    return content, file_info.name
+
+
+def _box_upload_file(content: bytes, filename: str, folder_id: str) -> str:
+    """Upload a file to Box. Returns the new file's ID."""
+    from box_sdk_gen import UploadFileAttributes, UploadFileAttributesParentField
+
+    client = _get_box_client()
+    attrs = UploadFileAttributes(
+        name=filename,
+        parent=UploadFileAttributesParentField(id=folder_id),
+    )
+    uploaded = client.uploads.upload_file(attrs, io.BytesIO(content))
+    return uploaded.entries[0].id
+
+
+def _box_find_or_create_subfolder(parent_folder_id: str, folder_name: str) -> str:
+    """Find a subfolder by name, or create it. Returns the folder ID."""
+    from box_sdk_gen import CreateFolderParent
+
+    client = _get_box_client()
+    items = client.folders.get_folder_items(parent_folder_id)
+    for entry in items.entries:
+        if entry.type == "folder" and entry.name == folder_name:
+            return entry.id
+
+    # Not found — create it
+    folder = client.folders.create_folder(
+        name=folder_name,
+        parent=CreateFolderParent(id=parent_folder_id),
+    )
+    logger.info("Created Box folder '%s' (ID: %s)", folder_name, folder.id)
+    return folder.id
+
+
+# ---------------------------------------------------------------------------
+# Search helper functions — deduplication, hydration, metadata extraction
+# ---------------------------------------------------------------------------
+
+def _deduplicate_results(matches) -> list[dict]:
+    """Deduplicate Pinecone results by template_id.
+
+    When the same template matches on multiple vector types (primary,
+    HyPE), collapse into a single entry with:
+    - The best (highest) score across all matching vectors
+    - A list of which vector types matched (match_types)
+    - The richest metadata available (primary > HyPE)
+
+    Returns a list sorted by best score descending.
+    """
+    by_template: dict[str, dict] = {}
+
+    for m in matches:
+        meta = m.metadata or {}
+        template_id = meta.get("template_id", m.id.split("__")[0])
+        vector_type = meta.get("vector_type", "unknown")
+        score = m.score
+
+        if template_id not in by_template:
+            by_template[template_id] = {
+                "template_id": template_id,
+                "best_score": score,
+                "match_types": [vector_type],
+                "metadata": dict(meta),
+                "has_primary_metadata": (vector_type == "primary"),
+            }
+        else:
+            entry = by_template[template_id]
+            if vector_type not in entry["match_types"]:
+                entry["match_types"].append(vector_type)
+            if score > entry["best_score"]:
+                entry["best_score"] = score
+            # Prefer primary metadata over HyPE (primary carries full 43+ fields)
+            if vector_type == "primary" and not entry["has_primary_metadata"]:
+                entry["metadata"] = dict(meta)
+                entry["has_primary_metadata"] = True
+
+    return sorted(by_template.values(), key=lambda x: x["best_score"], reverse=True)
+
+
+def _hydrate_metadata(deduplicated: list[dict]) -> list[dict]:
+    """Fetch full primary-vector metadata for templates matched only via HyPE.
+
+    HyPE vectors carry minimal metadata (6 fields). When a template was
+    found only through HyPE matches, we fetch the primary vector's metadata
+    via Pinecone's fetch-by-ID (fast batch operation) to give Claude the
+    narrative_summary, negative_boundaries, etc. it needs for evaluation.
+    """
+    needs_hydration = [
+        entry for entry in deduplicated
+        if not entry["has_primary_metadata"]
+    ]
+
+    if not needs_hydration:
+        return deduplicated
+
+    primary_ids = [f"{entry['template_id']}__primary" for entry in needs_hydration]
+
+    try:
+        fetch_response = index.fetch(ids=primary_ids)
+        fetched_vectors = fetch_response.vectors or {}
+
+        for entry in needs_hydration:
+            primary_id = f"{entry['template_id']}__primary"
+            if primary_id in fetched_vectors:
+                primary_meta = fetched_vectors[primary_id].metadata or {}
+                entry["metadata"] = dict(primary_meta)
+                entry["has_primary_metadata"] = True
+                logger.info("Hydrated metadata for: %s", entry["template_id"])
+            else:
+                logger.warning("Primary vector not found for: %s", entry["template_id"])
+
+    except Exception as e:
+        logger.error("Metadata hydration failed: %s", e)
+        # Non-fatal — results still have stub metadata from HyPE vectors
+
+    return deduplicated
+
+
+def _extract_evaluation_metadata(metadata: dict) -> dict:
+    """Extract the evaluation subset of metadata fields.
+
+    Returns only the ~20 fields Claude needs for intelligent triage.
+    Filters out empty/null values to keep the response compact.
+    """
+    result = {}
+    for field in EVALUATION_FIELDS:
+        value = metadata.get(field)
+        if value is not None and value != "" and value != []:
+            result[field] = value
+    return result
+
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -88,44 +335,8 @@ def _build_filter(practice_area: str, document_type: str) -> dict:
     return f
 
 
-# Fields to include in search result summaries (lightweight, most useful for Claude)
-SEARCH_RESULT_FIELDS = [
-    "template_id", "template_name", "document_type", "practice_area",
-    "sub_practice_area", "template_tier", "quality_confidence",
-    "narrative_summary", "jpl_doc_type", "service_modality",
-    "negative_boundaries", "companion_documents", "vector_type",
-]
-
-
-def _format_results(matches) -> list[dict]:
-    """Convert Pinecone match objects to serializable dicts.
-
-    For search results, includes only the most useful metadata fields
-    to keep response sizes manageable. Use jpl_get_template for full metadata.
-    """
-    results = []
-    for m in matches:
-        meta = m.metadata or {}
-
-        # Build a focused result with the most useful fields
-        result = {
-            "score": round(m.score, 4),
-            "vector_id": m.id,
-            "template_id": meta.get("template_id", m.id.split("__")[0]),
-        }
-
-        # Include available search-relevant metadata fields
-        for field in SEARCH_RESULT_FIELDS:
-            if field in meta and field != "template_id":
-                result[field] = meta[field]
-
-        results.append(result)
-
-    return results
-
-
 # ---------------------------------------------------------------------------
-# Tool: Search Templates
+# Tool: Search Templates (v4 — dedup + hydration + enriched metadata)
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -140,70 +351,116 @@ def _format_results(matches) -> list[dict]:
 )
 async def jpl_search_templates(
     query: str,
-    top_k: int = 10,
+    top_k: int = 20,
     practice_area: str = "",
     document_type: str = "",
+    include_full_metadata: bool = False,
 ) -> str:
     """Search the JPL template library by describing a legal scenario or
     document need in natural language.
 
-    Returns matching templates ranked by relevance with metadata including
-    practice area, document type, narrative summary, quality confidence,
-    template tier, and similarity scores.
+    Returns matching templates ranked by relevance, DEDUPLICATED by template
+    (each template appears once regardless of how many vectors matched), with
+    ENRICHED metadata for intelligent evaluation — including narrative summary,
+    negative boundaries, quality confidence, distinctiveness summary, factual
+    scenario, companion documents, and other fields Claude needs to make
+    informed recommendations.
 
-    Results may include matches from multiple vector types per template
-    (primary embeddings, HyPE hypothetical queries). The template_id field
-    links all vectors belonging to the same template. Use jpl_get_template
-    with the template_id to retrieve full metadata for any result.
+    Results include match_types showing which vector types matched (primary,
+    hype) — useful context for understanding why a template surfaced.
+
+    The default top_k of 20 supports broad retrieval for Claude-side reranking.
+    Claude should evaluate all results using the metadata, eliminate poor
+    matches via negative boundary triage, and present the best 1-3 to the user.
 
     Args:
         query: Natural language description of the legal scenario or
                document need — e.g. "quiet title petition for a tax sale
                property" or "I need to evict a commercial tenant for
                non-payment."
-        top_k: Number of results to return (1–20, default 10).
+        top_k: Number of raw Pinecone results before deduplication (1-50,
+               default 20). After deduplication, unique template count will
+               be lower. Increase for very broad searches.
         practice_area: Optional — limit results to a practice area
                        (e.g. "Foreclosure", "Quiet Title", "Evictions").
         document_type: Optional — limit results to a document type
                        (e.g. "Petition", "Motion", "Deed", "Lease").
+        include_full_metadata: If true, return ALL metadata fields for every
+                               result (equivalent to calling jpl_get_template
+                               on each). Default false returns the evaluation
+                               subset optimized for triage.
 
     Returns:
-        JSON object with result_count and an array of matching templates.
-        Each result includes a score, template_id, and key metadata fields.
-        Use jpl_get_template to retrieve the complete metadata for any template.
+        JSON object with unique_template_count and an array of deduplicated,
+        enriched template results. Use jpl_get_template to retrieve the
+        complete metadata for any finalist template.
     """
     try:
+        # Generate embedding
         embed_response = openai_client.embeddings.create(
             model=EMBEDDING_MODEL,
             input=query,
         )
         query_vector = embed_response.data[0].embedding
 
+        # Build filter and query Pinecone
         meta_filter = _build_filter(practice_area, document_type)
-
         query_kwargs: dict = {
             "vector": query_vector,
-            "top_k": min(max(top_k, 1), 20),
+            "top_k": min(max(top_k, 1), 50),
             "include_metadata": True,
         }
         if meta_filter:
             query_kwargs["filter"] = meta_filter
 
         results = index.query(**query_kwargs)
+        raw_matches = results.matches or []
 
-        formatted = _format_results(results.matches)
+        logger.info("Search: '%s' → %d raw matches", query[:80], len(raw_matches))
 
-        if not formatted:
+        if not raw_matches:
             return json.dumps({
-                "message": "No matching templates found in the library.",
-                "result_count": 0,
+                "unique_template_count": 0,
+                "raw_match_count": 0,
                 "results": [],
+                "message": "No templates found matching your query.",
             })
 
+        # Deduplicate by template_id
+        deduplicated = _deduplicate_results(raw_matches)
+
+        # Hydrate HyPE-only matches with primary vector metadata
+        deduplicated = _hydrate_metadata(deduplicated)
+
+        logger.info("After dedup: %d unique templates from %d raw matches",
+                     len(deduplicated), len(raw_matches))
+
+        # Build response with evaluation or full metadata
+        formatted_results = []
+        for entry in deduplicated:
+            metadata = entry["metadata"]
+
+            if include_full_metadata:
+                result_metadata = {
+                    k: v for k, v in metadata.items()
+                    if v is not None and v != "" and v != []
+                }
+            else:
+                result_metadata = _extract_evaluation_metadata(metadata)
+
+            result = {
+                "score": round(entry["best_score"], 4),
+                "template_id": entry["template_id"],
+                "match_types": entry["match_types"],
+                **result_metadata,
+            }
+            formatted_results.append(result)
+
         return json.dumps({
-            "result_count": len(formatted),
-            "results": formatted,
-        }, indent=2)
+            "unique_template_count": len(formatted_results),
+            "raw_match_count": len(raw_matches),
+            "results": formatted_results,
+        })
 
     except Exception as e:
         logger.error("Search error: %s", e, exc_info=True)
@@ -214,7 +471,7 @@ async def jpl_search_templates(
 
 
 # ---------------------------------------------------------------------------
-# Tool: Get Template by ID
+# Tool: Get Template by ID (unchanged from v3)
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -277,6 +534,148 @@ async def jpl_get_template(template_id: str) -> str:
         logger.error("Fetch error: %s", e, exc_info=True)
         return json.dumps({
             "error": f"Failed to retrieve template: {e}",
+        })
+
+
+# ---------------------------------------------------------------------------
+# Tool: Apply JPL Formatting (macro-as-a-service — unchanged from v3)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="apply_jpl_formatting",
+    annotations={
+        "title": "Apply JPL Formatting Macro",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def apply_jpl_formatting(
+    box_file_id: str,
+    output_folder_id: str = "",
+) -> str:
+    """Apply the JPL formatting macro to a .docx file stored in Box.
+
+    This tool bridges Claude to the JPL formatting macro running on the
+    Azure VM. It downloads the .docx from Box, sends it to the macro
+    service for formatting (margins, spacing, fonts, borders, etc.),
+    uploads the formatted result back to Box, and returns the new file ID.
+
+    Use this as the final step after producing a .docx with semantic style
+    labels and a JPLDocType tag. The macro reads those labels and applies
+    all visual formatting automatically.
+
+    Args:
+        box_file_id: The Box file ID of the .docx to format. The file
+                     must already be uploaded to Box.
+        output_folder_id: Optional — Box folder ID to upload the formatted
+                          file to. If not provided, uploads to the default
+                          "Macro Output" folder inside Skills Files for Claude.
+
+    Returns:
+        JSON object with the formatted file's Box file ID, filename, and
+        status. On error, returns a JSON object with error details and
+        fallback instructions for manual macro execution.
+    """
+    # --- Validate configuration ---
+    if not VM_MACRO_URL:
+        return json.dumps({
+            "error": "Macro service not configured.",
+            "detail": "VM_MACRO_URL environment variable is not set on the MCP server.",
+            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
+        })
+
+    try:
+        # --- Step 1: Download the .docx from Box ---
+        logger.info("apply_jpl_formatting: downloading Box file %s", box_file_id)
+        file_content, filename = _box_download_file(box_file_id)
+
+        if not filename.lower().endswith(".docx"):
+            return json.dumps({
+                "error": f"File '{filename}' is not a .docx file.",
+                "detail": "The macro service only accepts .docx files.",
+            })
+
+        logger.info("  Downloaded: %s (%s bytes)", filename, f"{len(file_content):,}")
+
+        # --- Step 2: Send to the VM macro API ---
+        logger.info("  Sending to macro service: %s", VM_MACRO_URL)
+
+        headers = {}
+        if VM_MACRO_API_KEY:
+            headers["Authorization"] = f"Bearer {VM_MACRO_API_KEY}"
+
+        async with httpx.AsyncClient(timeout=MACRO_API_TIMEOUT) as client:
+            response = await client.post(
+                VM_MACRO_URL,
+                files={"file": (filename, file_content, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+                headers=headers,
+            )
+
+        if response.status_code != 200:
+            error_detail = response.text[:500] if response.text else "No response body"
+            logger.error("  Macro service returned %d: %s", response.status_code, error_detail)
+            return json.dumps({
+                "error": f"Macro service returned HTTP {response.status_code}.",
+                "detail": error_detail,
+                "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
+            })
+
+        formatted_content = response.content
+        logger.info("  Macro service returned formatted file (%s bytes)", f"{len(formatted_content):,}")
+
+        # --- Step 3: Upload the formatted file back to Box ---
+        dest_folder = output_folder_id
+        if not dest_folder:
+            dest_folder = _box_find_or_create_subfolder(BOX_SKILLS_FOLDER, "Macro Output")
+
+        formatted_filename = filename
+        if not filename.lower().startswith("formatted_"):
+            stem = Path(filename).stem
+            formatted_filename = f"formatted_{stem}.docx"
+
+        logger.info("  Uploading formatted file to Box folder %s as '%s'", dest_folder, formatted_filename)
+        new_file_id = _box_upload_file(formatted_content, formatted_filename, dest_folder)
+        logger.info("  Upload complete. New Box file ID: %s", new_file_id)
+
+        return json.dumps({
+            "status": "success",
+            "formatted_file_id": new_file_id,
+            "formatted_filename": formatted_filename,
+            "original_file_id": box_file_id,
+            "original_filename": filename,
+            "output_folder_id": dest_folder,
+        })
+
+    except RuntimeError as e:
+        logger.error("apply_jpl_formatting config error: %s", e)
+        return json.dumps({
+            "error": str(e),
+            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
+        })
+
+    except httpx.TimeoutException:
+        logger.error("apply_jpl_formatting: macro service timed out after %ds", MACRO_API_TIMEOUT)
+        return json.dumps({
+            "error": f"Macro service timed out after {MACRO_API_TIMEOUT} seconds.",
+            "detail": "The VM may be processing another document or may be offline.",
+            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
+        })
+
+    except httpx.ConnectError as e:
+        logger.error("apply_jpl_formatting: cannot reach macro service at %s: %s", VM_MACRO_URL, e)
+        return json.dumps({
+            "error": "Cannot reach the macro service.",
+            "detail": f"Connection to {VM_MACRO_URL} failed. The VM may be offline.",
+            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
+        })
+
+    except Exception as e:
+        logger.error("apply_jpl_formatting unexpected error: %s", e, exc_info=True)
+        return json.dumps({
+            "error": f"Unexpected error: {e}",
+            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
         })
 
 
