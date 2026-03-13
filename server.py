@@ -538,7 +538,7 @@ async def jpl_get_template(template_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool: Apply JPL Formatting (macro-as-a-service — unchanged from v3)
+# Tool: Apply JPL Formatting (macro-as-a-service)
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -552,32 +552,50 @@ async def jpl_get_template(template_id: str) -> str:
     },
 )
 async def apply_jpl_formatting(
-    box_file_id: str,
+    file_content_base64: str = "",
+    filename: str = "document.docx",
+    box_file_id: str = "",
     output_folder_id: str = "",
 ) -> str:
-    """Apply the JPL formatting macro to a .docx file stored in Box.
+    """Apply the JPL formatting macro to a .docx file.
 
     This tool bridges Claude to the JPL formatting macro running on the
-    Azure VM. It downloads the .docx from Box, sends it to the macro
-    service for formatting (margins, spacing, fonts, borders, etc.),
-    uploads the formatted result back to Box, and returns the new file ID.
+    Azure VM. It sends the file to the macro service for formatting
+    (margins, spacing, fonts, borders, etc.) and returns the result.
 
-    Use this as the final step after producing a .docx with semantic style
-    labels and a JPLDocType tag. The macro reads those labels and applies
-    all visual formatting automatically.
+    TWO MODES — use one:
+
+    Mode 1 (PREFERRED for chat sessions): Pass the .docx file content
+    directly as base64. The macro runs and the formatted file is returned
+    as base64. No Box involvement. Use this when Claude has just built
+    a .docx locally.
+      - file_content_base64: base64-encoded .docx file content (required)
+      - filename: the filename (used for logging and the returned file)
+
+    Mode 2 (for pipeline/Box workflows): Pass a Box file ID. The file
+    is downloaded from Box, macro runs, result is uploaded back to Box.
+      - box_file_id: Box file ID of the .docx (required)
+      - output_folder_id: optional Box folder for the result
 
     Args:
-        box_file_id: The Box file ID of the .docx to format. The file
-                     must already be uploaded to Box.
-        output_folder_id: Optional — Box folder ID to upload the formatted
-                          file to. If not provided, uploads to the default
-                          "Macro Output" folder inside Skills Files for Claude.
+        file_content_base64: Base64-encoded .docx file content. Use this
+                             mode when Claude has built the file locally.
+                             Mutually exclusive with box_file_id.
+        filename: Filename for the document (default: document.docx).
+                  Used for logging and the returned filename.
+        box_file_id: Box file ID of the .docx to format. Use this mode
+                     when the file is already in Box.
+        output_folder_id: (Box mode only) Box folder ID for the result.
+                          Defaults to "Macro Output" folder.
 
     Returns:
-        JSON object with the formatted file's Box file ID, filename, and
-        status. On error, returns a JSON object with error details and
-        fallback instructions for manual macro execution.
+        Mode 1: JSON with status, formatted_file_base64, and filename.
+        Mode 2: JSON with status, formatted_file_id, and filename.
+        On error: JSON with error details and fallback instructions.
     """
+    import base64
+    from datetime import datetime as dt
+
     # --- Validate configuration ---
     if not VM_MACRO_URL:
         return json.dumps({
@@ -586,18 +604,37 @@ async def apply_jpl_formatting(
             "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
         })
 
+    if not file_content_base64 and not box_file_id:
+        return json.dumps({
+            "error": "No file provided. Supply either file_content_base64 or box_file_id.",
+        })
+
     try:
-        # --- Step 1: Download the .docx from Box ---
-        logger.info("apply_jpl_formatting: downloading Box file %s", box_file_id)
-        file_content, filename = _box_download_file(box_file_id)
-
-        if not filename.lower().endswith(".docx"):
-            return json.dumps({
-                "error": f"File '{filename}' is not a .docx file.",
-                "detail": "The macro service only accepts .docx files.",
-            })
-
-        logger.info("  Downloaded: %s (%s bytes)", filename, f"{len(file_content):,}")
+        # --- Step 1: Get the file content ---
+        if file_content_base64:
+            # Mode 1: Direct base64 content
+            mode = "direct"
+            try:
+                file_content = base64.b64decode(file_content_base64)
+            except Exception as e:
+                return json.dumps({
+                    "error": f"Invalid base64 content: {e}",
+                })
+            if not filename.lower().endswith(".docx"):
+                filename = filename + ".docx"
+            logger.info("apply_jpl_formatting (direct mode): %s (%s bytes)",
+                        filename, f"{len(file_content):,}")
+        else:
+            # Mode 2: Download from Box
+            mode = "box"
+            logger.info("apply_jpl_formatting (box mode): downloading Box file %s", box_file_id)
+            file_content, filename = _box_download_file(box_file_id)
+            if not filename.lower().endswith(".docx"):
+                return json.dumps({
+                    "error": f"File '{filename}' is not a .docx file.",
+                    "detail": "The macro service only accepts .docx files.",
+                })
+            logger.info("  Downloaded: %s (%s bytes)", filename, f"{len(file_content):,}")
 
         # --- Step 2: Send to the VM macro API ---
         logger.info("  Sending to macro service: %s", VM_MACRO_URL)
@@ -625,29 +662,42 @@ async def apply_jpl_formatting(
         formatted_content = response.content
         logger.info("  Macro service returned formatted file (%s bytes)", f"{len(formatted_content):,}")
 
-        # --- Step 3: Upload the formatted file back to Box ---
-        dest_folder = output_folder_id
-        if not dest_folder:
-            dest_folder = _box_find_or_create_subfolder(BOX_SKILLS_FOLDER, "Macro Output")
+        # --- Step 3: Return the result ---
+        if mode == "direct":
+            # Mode 1: Return the formatted file as base64
+            formatted_base64 = base64.b64encode(formatted_content).decode("ascii")
+            logger.info("  Returning formatted file as base64 (%s chars)", f"{len(formatted_base64):,}")
 
-        # Generate a unique filename with timestamp to prevent Box 409 conflicts
-        from datetime import datetime as dt
-        stem = Path(filename).stem
-        timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
-        formatted_filename = f"{stem}_formatted_{timestamp}.docx"
+            return json.dumps({
+                "status": "success",
+                "mode": "direct",
+                "formatted_file_base64": formatted_base64,
+                "filename": filename,
+            })
 
-        logger.info("  Uploading formatted file to Box folder %s as '%s'", dest_folder, formatted_filename)
-        new_file_id = _box_upload_file(formatted_content, formatted_filename, dest_folder)
-        logger.info("  Upload complete. New Box file ID: %s", new_file_id)
+        else:
+            # Mode 2: Upload to Box
+            dest_folder = output_folder_id
+            if not dest_folder:
+                dest_folder = _box_find_or_create_subfolder(BOX_SKILLS_FOLDER, "Macro Output")
 
-        return json.dumps({
-            "status": "success",
-            "formatted_file_id": new_file_id,
-            "formatted_filename": formatted_filename,
-            "original_file_id": box_file_id,
-            "original_filename": filename,
-            "output_folder_id": dest_folder,
-        })
+            stem = Path(filename).stem
+            timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+            formatted_filename = f"{stem}_formatted_{timestamp}.docx"
+
+            logger.info("  Uploading formatted file to Box folder %s as '%s'", dest_folder, formatted_filename)
+            new_file_id = _box_upload_file(formatted_content, formatted_filename, dest_folder)
+            logger.info("  Upload complete. New Box file ID: %s", new_file_id)
+
+            return json.dumps({
+                "status": "success",
+                "mode": "box",
+                "formatted_file_id": new_file_id,
+                "formatted_filename": formatted_filename,
+                "original_file_id": box_file_id,
+                "original_filename": filename,
+                "output_folder_id": dest_folder,
+            })
 
     except RuntimeError as e:
         logger.error("apply_jpl_formatting config error: %s", e)
