@@ -1,8 +1,9 @@
 """
 JPL Template System — MCP Server (v5)
 
-Connects Claude to the JPL template library (Pinecone) and the JPL
-formatting macro service (Azure VM).
+Connects Claude to the JPL template library (Pinecone), the JPL
+formatting macro service (Azure VM), and the template ingestion
+pipeline (Azure VM).
 
 Deployed on Railway. Claude Teams connects via streamable HTTP transport.
 
@@ -12,22 +13,15 @@ Tools:
   jpl_get_template        — Retrieve full metadata for a specific template
   apply_jpl_formatting    — Run the JPL formatting macro on a .docx file
                             via the Azure VM macro service
+  run_template_pipeline   — Trigger the template ingestion pipeline on
+                            the Azure VM (hopper mode)
 
 Changes from v4:
-  - apply_jpl_formatting gains Mode 3 (base64-via-Box transport):
-    Claude uploads base64-encoded .docx as a .txt to Box, passes that
-    file ID via base64_box_file_id. Railway downloads the .txt, decodes
-    it, POSTs the .docx to the VM, and returns the formatted file as
-    base64. The staging .txt is deleted from Box after processing.
-    This bypasses the LLM output token truncation that breaks Mode 1
-    for any file over ~2KB.
-  - New helper: _box_delete_file for staging file cleanup.
-  - jpl_search_templates and jpl_get_template unchanged from v4.
-
-Changes from v3 (carried forward):
-  - jpl_search_templates deduplication, HyPE hydration, enriched metadata
-  - Default top_k increased to 20 for retrieve-and-rerank
-  - New parameter: include_full_metadata (bool)
+  - New tool: run_template_pipeline — triggers the ingestion pipeline
+    on the Azure VM after documents are deposited in the hopper folder.
+    The pipeline runs as a background process; the tool returns immediately.
+  - New env var: VM_PIPELINE_URL (e.g. http://<VM-IP>:8080/run-pipeline)
+  - All other tools unchanged from v4
 
 Dependencies (requirements.txt):
   - mcp>=1.0.0
@@ -62,6 +56,9 @@ PINECONE_INDEX = "jpl-templates"
 # Macro API on the Azure VM
 VM_MACRO_URL = os.environ.get("VM_MACRO_URL", "")       # e.g. http://<VM-IP>:8080/format
 VM_MACRO_API_KEY = os.environ.get("VM_MACRO_API_KEY", "")
+
+# Pipeline trigger on the Azure VM (same server as macro, different endpoint)
+VM_PIPELINE_URL = os.environ.get("VM_PIPELINE_URL", "")  # e.g. http://<VM-IP>:8080/run-pipeline
 
 # Box JWT config — stored as a JSON string in the Railway env var
 BOX_JWT_CONFIG = os.environ.get("BOX_JWT_CONFIG", "")
@@ -195,22 +192,6 @@ def _box_find_or_create_subfolder(parent_folder_id: str, folder_name: str) -> st
     )
     logger.info("Created Box folder '%s' (ID: %s)", folder_name, folder.id)
     return folder.id
-
-
-def _box_delete_file(file_id: str) -> bool:
-    """Delete a file from Box. Returns True on success, False on failure.
-
-    Used for cleanup after the base64-via-Box transport — the .txt staging
-    file should not persist in Box after the round trip completes.
-    """
-    try:
-        client = _get_box_client()
-        client.files.delete_file_by_id(file_id)
-        logger.info("Deleted Box file %s (cleanup)", file_id)
-        return True
-    except Exception as e:
-        logger.warning("Could not delete Box file %s: %s (non-fatal)", file_id, e)
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +554,6 @@ async def apply_jpl_formatting(
     filename: str = "document.docx",
     box_file_id: str = "",
     output_folder_id: str = "",
-    base64_box_file_id: str = "",
 ) -> str:
     """Apply the JPL formatting macro to a .docx file.
 
@@ -581,49 +561,34 @@ async def apply_jpl_formatting(
     Azure VM. It sends the file to the macro service for formatting
     (margins, spacing, fonts, borders, etc.) and returns the result.
 
-    THREE MODES — use one:
+    TWO MODES — use one:
 
-    Mode 1 (small files only): Pass the .docx file content directly as
-    base64 via file_content_base64. Only reliable for very small files.
-    Large files will be truncated by the LLM's output token limit.
+    Mode 1 (PREFERRED for chat sessions): Pass the .docx file content
+    directly as base64. The macro runs and the formatted file is returned
+    as base64. No Box involvement. Use this when Claude has just built
+    a .docx locally.
       - file_content_base64: base64-encoded .docx file content (required)
       - filename: the filename (used for logging and the returned file)
 
-    Mode 2 (for pipeline/Box workflows): Pass a Box file ID of a .docx
-    already in Box. The file is downloaded from Box, macro runs, result
-    is uploaded back to Box.
+    Mode 2 (for pipeline/Box workflows): Pass a Box file ID. The file
+    is downloaded from Box, macro runs, result is uploaded back to Box.
       - box_file_id: Box file ID of the .docx (required)
       - output_folder_id: optional Box folder for the result
 
-    Mode 3 — PREFERRED for chat sessions: Upload the base64-encoded
-    .docx content as a .txt file to Box, then pass that file's ID here.
-    The server downloads the .txt, decodes the base64 to recover the
-    .docx, runs the macro, deletes the staging .txt from Box (cleanup),
-    and returns the formatted file as base64. This avoids the LLM
-    output token truncation problem of Mode 1 while keeping Box clean
-    (no files persist after the round trip).
-      - base64_box_file_id: Box file ID of a .txt containing base64 (required)
-      - filename: the filename (used for logging and the returned file)
-
     Args:
-        file_content_base64: Base64-encoded .docx file content. Only for
-                             very small files. Mutually exclusive with
-                             box_file_id and base64_box_file_id.
+        file_content_base64: Base64-encoded .docx file content. Use this
+                             mode when Claude has built the file locally.
+                             Mutually exclusive with box_file_id.
         filename: Filename for the document (default: document.docx).
                   Used for logging and the returned filename.
         box_file_id: Box file ID of the .docx to format. Use this mode
                      when the file is already in Box.
         output_folder_id: (Box mode only) Box folder ID for the result.
                           Defaults to "Macro Output" folder.
-        base64_box_file_id: Box file ID of a .txt file containing
-                            base64-encoded .docx content. PREFERRED mode
-                            for chat sessions. The .txt is deleted from
-                            Box after processing (cleanup).
 
     Returns:
         Mode 1: JSON with status, formatted_file_base64, and filename.
         Mode 2: JSON with status, formatted_file_id, and filename.
-        Mode 3: JSON with status, formatted_file_base64, and filename.
         On error: JSON with error details and fallback instructions.
     """
     import base64
@@ -637,40 +602,14 @@ async def apply_jpl_formatting(
             "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
         })
 
-    if not file_content_base64 and not box_file_id and not base64_box_file_id:
+    if not file_content_base64 and not box_file_id:
         return json.dumps({
-            "error": "No file provided. Supply file_content_base64, box_file_id, or base64_box_file_id.",
+            "error": "No file provided. Supply either file_content_base64 or box_file_id.",
         })
 
     try:
         # --- Step 1: Get the file content ---
-        if base64_box_file_id:
-            # Mode 3 (PREFERRED): Download .txt from Box, decode base64 → .docx bytes
-            mode = "base64_via_box"
-            logger.info("apply_jpl_formatting (base64-via-box mode): downloading Box file %s",
-                        base64_box_file_id)
-            txt_content, txt_filename = _box_download_file(base64_box_file_id)
-            logger.info("  Downloaded staging file: %s (%s bytes)",
-                        txt_filename, f"{len(txt_content):,}")
-
-            # Decode the base64 content to recover the .docx bytes
-            try:
-                # The .txt file contains raw base64 — strip any whitespace
-                b64_string = txt_content.decode("ascii", errors="ignore").strip()
-                file_content = base64.b64decode(b64_string)
-            except Exception as e:
-                # Clean up the staging file before returning error
-                _box_delete_file(base64_box_file_id)
-                return json.dumps({
-                    "error": f"Failed to decode base64 from Box file {base64_box_file_id}: {e}",
-                    "detail": "The .txt file in Box does not contain valid base64-encoded content.",
-                })
-
-            if not filename.lower().endswith(".docx"):
-                filename = filename + ".docx"
-            logger.info("  Decoded .docx: %s (%s bytes)", filename, f"{len(file_content):,}")
-
-        elif file_content_base64:
+        if file_content_base64:
             # Mode 1: Direct base64 content
             mode = "direct"
             try:
@@ -712,8 +651,6 @@ async def apply_jpl_formatting(
         if response.status_code != 200:
             error_detail = response.text[:500] if response.text else "No response body"
             logger.error("  Macro service returned %d: %s", response.status_code, error_detail)
-            if base64_box_file_id:
-                _box_delete_file(base64_box_file_id)
             return json.dumps({
                 "error": f"Macro service returned HTTP {response.status_code}.",
                 "detail": error_detail,
@@ -732,21 +669,6 @@ async def apply_jpl_formatting(
             return json.dumps({
                 "status": "success",
                 "mode": "direct",
-                "formatted_file_base64": formatted_base64,
-                "filename": filename,
-            })
-
-        elif mode == "base64_via_box":
-            # Mode 3: Delete the staging .txt from Box, return formatted as base64
-            logger.info("  Cleaning up staging file from Box: %s", base64_box_file_id)
-            _box_delete_file(base64_box_file_id)
-
-            formatted_base64 = base64.b64encode(formatted_content).decode("ascii")
-            logger.info("  Returning formatted file as base64 (%s chars)", f"{len(formatted_base64):,}")
-
-            return json.dumps({
-                "status": "success",
-                "mode": "base64_via_box",
                 "formatted_file_base64": formatted_base64,
                 "filename": filename,
             })
@@ -777,8 +699,6 @@ async def apply_jpl_formatting(
 
     except RuntimeError as e:
         logger.error("apply_jpl_formatting config error: %s", e)
-        if base64_box_file_id:
-            _box_delete_file(base64_box_file_id)
         return json.dumps({
             "error": str(e),
             "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
@@ -786,8 +706,6 @@ async def apply_jpl_formatting(
 
     except httpx.TimeoutException:
         logger.error("apply_jpl_formatting: macro service timed out after %ds", MACRO_API_TIMEOUT)
-        if base64_box_file_id:
-            _box_delete_file(base64_box_file_id)
         return json.dumps({
             "error": f"Macro service timed out after {MACRO_API_TIMEOUT} seconds.",
             "detail": "The VM may be processing another document or may be offline.",
@@ -796,8 +714,6 @@ async def apply_jpl_formatting(
 
     except httpx.ConnectError as e:
         logger.error("apply_jpl_formatting: cannot reach macro service at %s: %s", VM_MACRO_URL, e)
-        if base64_box_file_id:
-            _box_delete_file(base64_box_file_id)
         return json.dumps({
             "error": "Cannot reach the macro service.",
             "detail": f"Connection to {VM_MACRO_URL} failed. The VM may be offline.",
@@ -806,11 +722,121 @@ async def apply_jpl_formatting(
 
     except Exception as e:
         logger.error("apply_jpl_formatting unexpected error: %s", e, exc_info=True)
-        if base64_box_file_id:
-            _box_delete_file(base64_box_file_id)
         return json.dumps({
             "error": f"Unexpected error: {e}",
             "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
+        })
+
+
+# ---------------------------------------------------------------------------
+# Tool: run_template_pipeline
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="run_template_pipeline",
+    annotations={
+        "title": "Run Template Ingestion Pipeline",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def run_template_pipeline() -> str:
+    """Trigger the JPL template ingestion pipeline on the Azure VM.
+
+    This runs the pipeline in hopper mode — it processes ALL documents
+    currently in the Box hopper folder (deposited by the intake skill
+    or manually). The pipeline runs as a background process on the VM;
+    this tool returns immediately with confirmation that it started.
+
+    Each document goes through the full chain: deep analysis → metadata
+    extraction → search optimization → templatization → formatting →
+    macro → .dotx conversion → Box upload + Pinecone indexing.
+    Typical time: 15-20 minutes per document.
+
+    WHEN TO CALL:
+      - After depositing documents in the hopper folder via the intake skill
+      - After the user confirms they want to run the pipeline
+      - Do NOT call if no documents have been deposited — the pipeline
+        will find an empty hopper and exit immediately
+
+    Returns:
+        JSON with trigger status:
+        - "triggered": Pipeline started successfully. Tell the user their
+          template(s) should appear in the library within 15-20 minutes
+          per document.
+        - "already_running": A pipeline run is already in progress. Tell
+          the user to wait for it to finish.
+        - "error": Something went wrong. Show the error and offer the
+          manual fallback: run `py pipeline_v3.py --hopper` on the VM.
+    """
+    if not VM_PIPELINE_URL:
+        return json.dumps({
+            "error": "Pipeline trigger not configured.",
+            "detail": "VM_PIPELINE_URL environment variable is not set on the MCP server.",
+            "fallback": "Run the pipeline manually on the VM: py pipeline_v3.py --hopper",
+        })
+
+    try:
+        headers = {}
+        if VM_MACRO_API_KEY:
+            headers["Authorization"] = f"Bearer {VM_MACRO_API_KEY}"
+
+        logger.info("run_template_pipeline: triggering %s", VM_PIPELINE_URL)
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(VM_PIPELINE_URL, headers=headers)
+
+        # 409 = pipeline already running (not an error)
+        if response.status_code == 409:
+            data = response.json()
+            logger.info("run_template_pipeline: already running (%s)", data.get("started_at"))
+            return json.dumps({
+                "status": "already_running",
+                "message": data.get("message", "Pipeline is already running."),
+                "started_at": data.get("started_at"),
+                "elapsed_seconds": data.get("elapsed_seconds"),
+            })
+
+        if response.status_code != 200:
+            error_detail = response.text[:500] if response.text else "No response body"
+            logger.error("run_template_pipeline: VM returned %d: %s", response.status_code, error_detail)
+            return json.dumps({
+                "error": f"VM returned HTTP {response.status_code}.",
+                "detail": error_detail,
+                "fallback": "Run the pipeline manually on the VM: py pipeline_v3.py --hopper",
+            })
+
+        data = response.json()
+        logger.info("run_template_pipeline: triggered (PID %s)", data.get("pid"))
+        return json.dumps({
+            "status": "triggered",
+            "message": data.get("message", "Pipeline triggered successfully."),
+            "started_at": data.get("started_at"),
+        })
+
+    except httpx.ConnectError as e:
+        logger.error("run_template_pipeline: cannot reach VM at %s: %s", VM_PIPELINE_URL, e)
+        return json.dumps({
+            "error": "Cannot reach the VM.",
+            "detail": f"Connection to {VM_PIPELINE_URL} failed. The VM may be offline or the port may not be open.",
+            "fallback": "Run the pipeline manually on the VM: py pipeline_v3.py --hopper",
+        })
+
+    except httpx.TimeoutException:
+        logger.error("run_template_pipeline: request to VM timed out")
+        return json.dumps({
+            "error": "Request to VM timed out after 30 seconds.",
+            "detail": "The VM may be offline or unresponsive.",
+            "fallback": "Run the pipeline manually on the VM: py pipeline_v3.py --hopper",
+        })
+
+    except Exception as e:
+        logger.error("run_template_pipeline unexpected error: %s", e, exc_info=True)
+        return json.dumps({
+            "error": f"Unexpected error: {e}",
+            "fallback": "Run the pipeline manually on the VM: py pipeline_v3.py --hopper",
         })
 
 
