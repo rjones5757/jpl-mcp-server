@@ -630,10 +630,11 @@ async def apply_jpl_formatting(
         if not dest_folder:
             dest_folder = _box_find_or_create_subfolder(BOX_SKILLS_FOLDER, "Macro Output")
 
-        formatted_filename = filename
-        if not filename.lower().startswith("formatted_"):
-            stem = Path(filename).stem
-            formatted_filename = f"formatted_{stem}.docx"
+        # Generate a unique filename with timestamp to prevent Box 409 conflicts
+        from datetime import datetime as dt
+        stem = Path(filename).stem
+        timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+        formatted_filename = f"{stem}_formatted_{timestamp}.docx"
 
         logger.info("  Uploading formatted file to Box folder %s as '%s'", dest_folder, formatted_filename)
         new_file_id = _box_upload_file(formatted_content, formatted_filename, dest_folder)
