@@ -1,5 +1,5 @@
 """
-JPL Template System — MCP Server (v5)
+JPL Template System — MCP Server (v6)
 
 Connects Claude to the JPL template library (Pinecone), the JPL
 formatting macro service (Azure VM), and the template ingestion
@@ -8,20 +8,20 @@ pipeline (Azure VM).
 Deployed on Railway. Claude Teams connects via streamable HTTP transport.
 
 Tools:
-  jpl_search_templates    — Semantic search with deduplication, metadata
-                            hydration, and enriched evaluation metadata
-  jpl_get_template        — Retrieve full metadata for a specific template
-  apply_jpl_formatting    — Run the JPL formatting macro on a .docx file
-                            via the Azure VM macro service
-  run_template_pipeline   — Trigger the template ingestion pipeline on
-                            the Azure VM (hopper mode)
+  jpl_search_templates      — Semantic search with deduplication, metadata
+                              hydration, and enriched evaluation metadata
+  jpl_get_template          — Retrieve full metadata for a specific template
+  apply_jpl_formatting      — Run the JPL formatting macro on a .docx file
+                              via the Azure VM macro service
+  run_template_pipeline     — Trigger the template ingestion pipeline on
+                              the Azure VM (hopper mode)
+  check_pipeline_status     — Check whether the pipeline is running, idle,
+                              or completed, with log tail for diagnostics
 
-Changes from v4:
-  - New tool: run_template_pipeline — triggers the ingestion pipeline
-    on the Azure VM after documents are deposited in the hopper folder.
-    The pipeline runs as a background process; the tool returns immediately.
-  - New env var: VM_PIPELINE_URL (e.g. http://<VM-IP>:8080/run-pipeline)
-  - All other tools unchanged from v4
+Changes from v5:
+  - New tool: check_pipeline_status — hits the VM's /pipeline-status
+    endpoint so Claude can report pipeline progress without RDP access.
+  - All other tools unchanged from v5.
 
 Dependencies (requirements.txt):
   - mcp>=1.0.0
@@ -54,11 +54,11 @@ EMBEDDING_MODEL = "text-embedding-3-large"
 PINECONE_INDEX = "jpl-templates"
 
 # Macro API on the Azure VM
-VM_MACRO_URL = os.environ.get("VM_MACRO_URL", "")       # e.g. http://<VM-IP>:8080/format
+VM_MACRO_URL = os.environ.get("VM_MACRO_URL", "")       # e.g. http://<VM-IP>:8443/format
 VM_MACRO_API_KEY = os.environ.get("VM_MACRO_API_KEY", "")
 
 # Pipeline trigger on the Azure VM (same server as macro, different endpoint)
-VM_PIPELINE_URL = os.environ.get("VM_PIPELINE_URL", "")  # e.g. http://<VM-IP>:8080/run-pipeline
+VM_PIPELINE_URL = os.environ.get("VM_PIPELINE_URL", "")  # e.g. http://<VM-IP>:8443/run-pipeline
 
 # Box JWT config — stored as a JSON string in the Railway env var
 BOX_JWT_CONFIG = os.environ.get("BOX_JWT_CONFIG", "")
@@ -128,11 +128,7 @@ _box_client = None
 
 
 def _get_box_client():
-    """Create or return the cached Box client.
-
-    Uses the BOX_JWT_CONFIG environment variable, which contains the full
-    JWT config JSON as a string (no file path needed on Railway).
-    """
+    """Create or return the cached Box client."""
     global _box_client
     if _box_client is not None:
         return _box_client
@@ -185,7 +181,6 @@ def _box_find_or_create_subfolder(parent_folder_id: str, folder_name: str) -> st
         if entry.type == "folder" and entry.name == folder_name:
             return entry.id
 
-    # Not found — create it
     folder = client.folders.create_folder(
         name=folder_name,
         parent=CreateFolderParent(id=parent_folder_id),
@@ -195,20 +190,26 @@ def _box_find_or_create_subfolder(parent_folder_id: str, folder_name: str) -> st
 
 
 # ---------------------------------------------------------------------------
+# VM API helper — derive status URL from pipeline URL
+# ---------------------------------------------------------------------------
+
+def _get_pipeline_status_url() -> str:
+    """Derive the /pipeline-status URL from VM_PIPELINE_URL.
+
+    VM_PIPELINE_URL is e.g. http://128.203.187.19:8443/run-pipeline
+    We replace /run-pipeline with /pipeline-status.
+    """
+    if not VM_PIPELINE_URL:
+        return ""
+    return VM_PIPELINE_URL.replace("/run-pipeline", "/pipeline-status")
+
+
+# ---------------------------------------------------------------------------
 # Search helper functions — deduplication, hydration, metadata extraction
 # ---------------------------------------------------------------------------
 
 def _deduplicate_results(matches) -> list[dict]:
-    """Deduplicate Pinecone results by template_id.
-
-    When the same template matches on multiple vector types (primary,
-    HyPE), collapse into a single entry with:
-    - The best (highest) score across all matching vectors
-    - A list of which vector types matched (match_types)
-    - The richest metadata available (primary > HyPE)
-
-    Returns a list sorted by best score descending.
-    """
+    """Deduplicate Pinecone results by template_id."""
     by_template: dict[str, dict] = {}
 
     for m in matches:
@@ -231,7 +232,6 @@ def _deduplicate_results(matches) -> list[dict]:
                 entry["match_types"].append(vector_type)
             if score > entry["best_score"]:
                 entry["best_score"] = score
-            # Prefer primary metadata over HyPE (primary carries full 43+ fields)
             if vector_type == "primary" and not entry["has_primary_metadata"]:
                 entry["metadata"] = dict(meta)
                 entry["has_primary_metadata"] = True
@@ -240,13 +240,7 @@ def _deduplicate_results(matches) -> list[dict]:
 
 
 def _hydrate_metadata(deduplicated: list[dict]) -> list[dict]:
-    """Fetch full primary-vector metadata for templates matched only via HyPE.
-
-    HyPE vectors carry minimal metadata (6 fields). When a template was
-    found only through HyPE matches, we fetch the primary vector's metadata
-    via Pinecone's fetch-by-ID (fast batch operation) to give Claude the
-    narrative_summary, negative_boundaries, etc. it needs for evaluation.
-    """
+    """Fetch full primary-vector metadata for templates matched only via HyPE."""
     needs_hydration = [
         entry for entry in deduplicated
         if not entry["has_primary_metadata"]
@@ -273,17 +267,12 @@ def _hydrate_metadata(deduplicated: list[dict]) -> list[dict]:
 
     except Exception as e:
         logger.error("Metadata hydration failed: %s", e)
-        # Non-fatal — results still have stub metadata from HyPE vectors
 
     return deduplicated
 
 
 def _extract_evaluation_metadata(metadata: dict) -> dict:
-    """Extract the evaluation subset of metadata fields.
-
-    Returns only the ~20 fields Claude needs for intelligent triage.
-    Filters out empty/null values to keep the response compact.
-    """
+    """Extract the evaluation subset of metadata fields."""
     result = {}
     for field in EVALUATION_FIELDS:
         value = metadata.get(field)
@@ -334,7 +323,7 @@ def _build_filter(practice_area: str, document_type: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Tool: Search Templates (v4 — dedup + hydration + enriched metadata)
+# Tool: Search Templates
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -359,49 +348,27 @@ async def jpl_search_templates(
 
     Returns matching templates ranked by relevance, DEDUPLICATED by template
     (each template appears once regardless of how many vectors matched), with
-    ENRICHED metadata for intelligent evaluation — including narrative summary,
-    negative boundaries, quality confidence, distinctiveness summary, factual
-    scenario, companion documents, and other fields Claude needs to make
-    informed recommendations.
-
-    Results include match_types showing which vector types matched (primary,
-    hype) — useful context for understanding why a template surfaced.
-
-    The default top_k of 20 supports broad retrieval for Claude-side reranking.
-    Claude should evaluate all results using the metadata, eliminate poor
-    matches via negative boundary triage, and present the best 1-3 to the user.
+    ENRICHED metadata for intelligent evaluation.
 
     Args:
         query: Natural language description of the legal scenario or
-               document need — e.g. "quiet title petition for a tax sale
-               property" or "I need to evict a commercial tenant for
-               non-payment."
+               document need.
         top_k: Number of raw Pinecone results before deduplication (1-50,
-               default 20). After deduplication, unique template count will
-               be lower. Increase for very broad searches.
-        practice_area: Optional — limit results to a practice area
-                       (e.g. "Foreclosure", "Quiet Title", "Evictions").
-        document_type: Optional — limit results to a document type
-                       (e.g. "Petition", "Motion", "Deed", "Lease").
-        include_full_metadata: If true, return ALL metadata fields for every
-                               result (equivalent to calling jpl_get_template
-                               on each). Default false returns the evaluation
-                               subset optimized for triage.
+               default 20).
+        practice_area: Optional filter (e.g. "Foreclosure", "Quiet Title").
+        document_type: Optional filter (e.g. "Petition", "Motion", "Deed").
+        include_full_metadata: If true, return ALL metadata fields.
 
     Returns:
-        JSON object with unique_template_count and an array of deduplicated,
-        enriched template results. Use jpl_get_template to retrieve the
-        complete metadata for any finalist template.
+        JSON object with unique_template_count and deduplicated results.
     """
     try:
-        # Generate embedding
         embed_response = openai_client.embeddings.create(
             model=EMBEDDING_MODEL,
             input=query,
         )
         query_vector = embed_response.data[0].embedding
 
-        # Build filter and query Pinecone
         meta_filter = _build_filter(practice_area, document_type)
         query_kwargs: dict = {
             "vector": query_vector,
@@ -424,16 +391,12 @@ async def jpl_search_templates(
                 "message": "No templates found matching your query.",
             })
 
-        # Deduplicate by template_id
         deduplicated = _deduplicate_results(raw_matches)
-
-        # Hydrate HyPE-only matches with primary vector metadata
         deduplicated = _hydrate_metadata(deduplicated)
 
         logger.info("After dedup: %d unique templates from %d raw matches",
                      len(deduplicated), len(raw_matches))
 
-        # Build response with evaluation or full metadata
         formatted_results = []
         for entry in deduplicated:
             metadata = entry["metadata"]
@@ -469,7 +432,7 @@ async def jpl_search_templates(
 
 
 # ---------------------------------------------------------------------------
-# Tool: Get Template by ID (unchanged from v3)
+# Tool: Get Template by ID
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -483,31 +446,19 @@ async def jpl_search_templates(
     },
 )
 async def jpl_get_template(template_id: str) -> str:
-    """Retrieve the full metadata for a specific template by its Pinecone ID.
+    """Retrieve the full metadata for a specific template by its ID.
 
-    Use this after jpl_search_templates to get complete details about a
-    template — including its full narrative summary, template header,
-    negative boundaries, companion documents, quality confidence, and all
-    other metadata fields.
-
-    Accepts either the base template_id (e.g.
-    "curative-title-demand-letter-under-oklahoma-curative-act") or the
-    full Pinecone vector ID with suffix (e.g.
-    "curative-title-demand-letter-under-oklahoma-curative-act__primary").
+    Accepts either the base template_id or the full Pinecone vector ID
+    with __primary suffix.
 
     Args:
-        template_id: The template ID — either the base ID from metadata
-                     or the full vector ID from search results.
+        template_id: The template ID from search results.
 
     Returns:
-        JSON object with the template's full metadata, or an error message
-        if the ID is not found.
+        JSON object with the template's full metadata.
     """
     try:
-        # Build candidate IDs to try
         ids_to_try = [template_id]
-
-        # If the ID doesn't already have a vector suffix, also try __primary
         if "__" not in template_id:
             ids_to_try.append(f"{template_id}__primary")
 
@@ -557,44 +508,23 @@ async def apply_jpl_formatting(
 ) -> str:
     """Apply the JPL formatting macro to a .docx file.
 
-    This tool bridges Claude to the JPL formatting macro running on the
-    Azure VM. It sends the file to the macro service for formatting
-    (margins, spacing, fonts, borders, etc.) and returns the result.
-
     TWO MODES — use one:
 
-    Mode 1 (PREFERRED for chat sessions): Pass the .docx file content
-    directly as base64. The macro runs and the formatted file is returned
-    as base64. No Box involvement. Use this when Claude has just built
-    a .docx locally.
-      - file_content_base64: base64-encoded .docx file content (required)
-      - filename: the filename (used for logging and the returned file)
-
-    Mode 2 (for pipeline/Box workflows): Pass a Box file ID. The file
-    is downloaded from Box, macro runs, result is uploaded back to Box.
-      - box_file_id: Box file ID of the .docx (required)
-      - output_folder_id: optional Box folder for the result
+    Mode 1 (PREFERRED for chat sessions): Pass file_content_base64.
+    Mode 2 (for pipeline/Box workflows): Pass box_file_id.
 
     Args:
-        file_content_base64: Base64-encoded .docx file content. Use this
-                             mode when Claude has built the file locally.
-                             Mutually exclusive with box_file_id.
+        file_content_base64: Base64-encoded .docx file content.
         filename: Filename for the document (default: document.docx).
-                  Used for logging and the returned filename.
-        box_file_id: Box file ID of the .docx to format. Use this mode
-                     when the file is already in Box.
+        box_file_id: Box file ID of the .docx to format.
         output_folder_id: (Box mode only) Box folder ID for the result.
-                          Defaults to "Macro Output" folder.
 
     Returns:
-        Mode 1: JSON with status, formatted_file_base64, and filename.
-        Mode 2: JSON with status, formatted_file_id, and filename.
-        On error: JSON with error details and fallback instructions.
+        JSON with status and formatted file (base64 or Box file ID).
     """
     import base64
     from datetime import datetime as dt
 
-    # --- Validate configuration ---
     if not VM_MACRO_URL:
         return json.dumps({
             "error": "Macro service not configured.",
@@ -608,22 +538,17 @@ async def apply_jpl_formatting(
         })
 
     try:
-        # --- Step 1: Get the file content ---
         if file_content_base64:
-            # Mode 1: Direct base64 content
             mode = "direct"
             try:
                 file_content = base64.b64decode(file_content_base64)
             except Exception as e:
-                return json.dumps({
-                    "error": f"Invalid base64 content: {e}",
-                })
+                return json.dumps({"error": f"Invalid base64 content: {e}"})
             if not filename.lower().endswith(".docx"):
                 filename = filename + ".docx"
             logger.info("apply_jpl_formatting (direct mode): %s (%s bytes)",
                         filename, f"{len(file_content):,}")
         else:
-            # Mode 2: Download from Box
             mode = "box"
             logger.info("apply_jpl_formatting (box mode): downloading Box file %s", box_file_id)
             file_content, filename = _box_download_file(box_file_id)
@@ -634,7 +559,6 @@ async def apply_jpl_formatting(
                 })
             logger.info("  Downloaded: %s (%s bytes)", filename, f"{len(file_content):,}")
 
-        # --- Step 2: Send to the VM macro API ---
         logger.info("  Sending to macro service: %s", VM_MACRO_URL)
 
         headers = {}
@@ -660,21 +584,15 @@ async def apply_jpl_formatting(
         formatted_content = response.content
         logger.info("  Macro service returned formatted file (%s bytes)", f"{len(formatted_content):,}")
 
-        # --- Step 3: Return the result ---
         if mode == "direct":
-            # Mode 1: Return the formatted file as base64
             formatted_base64 = base64.b64encode(formatted_content).decode("ascii")
-            logger.info("  Returning formatted file as base64 (%s chars)", f"{len(formatted_base64):,}")
-
             return json.dumps({
                 "status": "success",
                 "mode": "direct",
                 "formatted_file_base64": formatted_base64,
                 "filename": filename,
             })
-
         else:
-            # Mode 2: Upload to Box
             dest_folder = output_folder_id
             if not dest_folder:
                 dest_folder = _box_find_or_create_subfolder(BOX_SKILLS_FOLDER, "Macro Output")
@@ -729,7 +647,7 @@ async def apply_jpl_formatting(
 
 
 # ---------------------------------------------------------------------------
-# Tool: run_template_pipeline
+# Tool: Run Template Pipeline
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -767,7 +685,9 @@ async def run_template_pipeline() -> str:
           template(s) should appear in the library within 15-20 minutes
           per document.
         - "already_running": A pipeline run is already in progress. Tell
-          the user to wait for it to finish.
+          the user to wait for it to finish. The pipeline re-scans the
+          hopper after each batch, so new documents will be picked up
+          automatically.
         - "error": Something went wrong. Show the error and offer the
           manual fallback: run `py pipeline_v3.py --hopper` on the VM.
     """
@@ -788,7 +708,6 @@ async def run_template_pipeline() -> str:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(VM_PIPELINE_URL, headers=headers)
 
-        # 409 = pipeline already running (not an error)
         if response.status_code == 409:
             data = response.json()
             logger.info("run_template_pipeline: already running (%s)", data.get("started_at"))
@@ -841,6 +760,92 @@ async def run_template_pipeline() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool: Check Pipeline Status (NEW in v6)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="check_pipeline_status",
+    annotations={
+        "title": "Check Pipeline Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def check_pipeline_status() -> str:
+    """Check the current status of the template ingestion pipeline.
+
+    Reports whether the pipeline is running, idle, or completed, along
+    with elapsed time and the last 30 lines of the pipeline log for
+    diagnostics.
+
+    Use this to monitor pipeline progress during batch processing or
+    to check if a triggered run has completed.
+
+    Returns:
+        JSON with pipeline status:
+        - "running": Pipeline is actively processing. Includes elapsed
+          time and log tail showing current activity.
+        - "completed": Pipeline finished. Includes exit code and log tail.
+        - "idle": No pipeline run recorded since the API server started.
+        - "error": Could not reach the VM to check status.
+    """
+    status_url = _get_pipeline_status_url()
+
+    if not status_url:
+        return json.dumps({
+            "error": "Pipeline status not configured.",
+            "detail": "VM_PIPELINE_URL environment variable is not set on the MCP server.",
+            "fallback": "Check the pipeline log on the VM: type \"C:\\JPL Templates System Pipeline\\pipeline_latest.log\"",
+        })
+
+    try:
+        headers = {}
+        if VM_MACRO_API_KEY:
+            headers["Authorization"] = f"Bearer {VM_MACRO_API_KEY}"
+
+        logger.info("check_pipeline_status: querying %s", status_url)
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(status_url, headers=headers)
+
+        if response.status_code != 200:
+            error_detail = response.text[:500] if response.text else "No response body"
+            logger.error("check_pipeline_status: VM returned %d: %s", response.status_code, error_detail)
+            return json.dumps({
+                "error": f"VM returned HTTP {response.status_code}.",
+                "detail": error_detail,
+            })
+
+        data = response.json()
+        logger.info("check_pipeline_status: %s", data.get("status"))
+        return json.dumps(data)
+
+    except httpx.ConnectError as e:
+        logger.error("check_pipeline_status: cannot reach VM: %s", e)
+        return json.dumps({
+            "error": "Cannot reach the VM.",
+            "detail": f"Connection failed. The VM may be offline.",
+            "fallback": "Check the pipeline log on the VM: type \"C:\\JPL Templates System Pipeline\\pipeline_latest.log\"",
+        })
+
+    except httpx.TimeoutException:
+        logger.error("check_pipeline_status: request timed out")
+        return json.dumps({
+            "error": "Request to VM timed out.",
+            "detail": "The VM may be offline or unresponsive.",
+            "fallback": "Check the pipeline log on the VM: type \"C:\\JPL Templates System Pipeline\\pipeline_latest.log\"",
+        })
+
+    except Exception as e:
+        logger.error("check_pipeline_status unexpected error: %s", e, exc_info=True)
+        return json.dumps({
+            "error": f"Unexpected error: {e}",
+        })
+
+
+# ---------------------------------------------------------------------------
 # ASGI app — used by uvicorn
 # ---------------------------------------------------------------------------
 
@@ -853,5 +858,5 @@ app = mcp.streamable_http_app()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info("Starting JPL Template MCP server on 0.0.0.0:%d", port)
+    logger.info("Starting JPL Template MCP server v6 on 0.0.0.0:%d", port)
     uvicorn.run(app, host="0.0.0.0", port=port)
