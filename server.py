@@ -21,6 +21,10 @@ Tools:
 Changes from v5:
   - New tool: check_pipeline_status — hits the VM's /pipeline-status
     endpoint so Claude can report pipeline progress without RDP access.
+  - Lazy client initialization: OpenAI and Pinecone clients are now
+    created on first tool call, not at import time. Prevents server
+    startup failures when Pinecone is temporarily unreachable (previously
+    caused Railway boot loops with ConnectTimeoutError).
   - All other tools unchanged from v5.
 
 Dependencies (requirements.txt):
@@ -111,20 +115,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Initialize API clients (module-level — persist across requests)
+# API clients — lazy initialization
+# ---------------------------------------------------------------------------
+# All clients are created on first use, not at import time. This ensures
+# the server starts immediately even if Pinecone or OpenAI are temporarily
+# unreachable. Previously, module-level Pinecone initialization blocked
+# server startup during Pinecone outages (Railway logs showed repeated
+# ConnectTimeoutError to api.pinecone.io, preventing the server from
+# ever listening for requests).
 # ---------------------------------------------------------------------------
 
-openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-index = pc.Index(PINECONE_INDEX)
-
-logger.info("API clients initialized (OpenAI + Pinecone index '%s')", PINECONE_INDEX)
-
-# ---------------------------------------------------------------------------
-# Box client (lazy init — only created when the formatting tool is called)
-# ---------------------------------------------------------------------------
-
+_openai_client = None
+_pinecone_index = None
 _box_client = None
+
+
+def _get_openai_client():
+    """Create or return the cached OpenAI client."""
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        logger.info("OpenAI client initialized")
+    return _openai_client
+
+
+def _get_pinecone_index():
+    """Create or return the cached Pinecone index client."""
+    global _pinecone_index
+    if _pinecone_index is None:
+        pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+        _pinecone_index = pc.Index(PINECONE_INDEX)
+        logger.info("Pinecone index '%s' connected", PINECONE_INDEX)
+    return _pinecone_index
 
 
 def _get_box_client():
@@ -252,7 +274,7 @@ def _hydrate_metadata(deduplicated: list[dict]) -> list[dict]:
     primary_ids = [f"{entry['template_id']}__primary" for entry in needs_hydration]
 
     try:
-        fetch_response = index.fetch(ids=primary_ids)
+        fetch_response = _get_pinecone_index().fetch(ids=primary_ids)
         fetched_vectors = fetch_response.vectors or {}
 
         for entry in needs_hydration:
@@ -363,7 +385,7 @@ async def jpl_search_templates(
         JSON object with unique_template_count and deduplicated results.
     """
     try:
-        embed_response = openai_client.embeddings.create(
+        embed_response = _get_openai_client().embeddings.create(
             model=EMBEDDING_MODEL,
             input=query,
         )
@@ -378,7 +400,7 @@ async def jpl_search_templates(
         if meta_filter:
             query_kwargs["filter"] = meta_filter
 
-        results = index.query(**query_kwargs)
+        results = _get_pinecone_index().query(**query_kwargs)
         raw_matches = results.matches or []
 
         logger.info("Search: '%s' → %d raw matches", query[:80], len(raw_matches))
@@ -463,7 +485,7 @@ async def jpl_get_template(template_id: str) -> str:
             ids_to_try.append(f"{template_id}__primary")
 
         for candidate_id in ids_to_try:
-            result = index.fetch(ids=[candidate_id])
+            result = _get_pinecone_index().fetch(ids=[candidate_id])
 
             if candidate_id in result.vectors:
                 vector_data = result.vectors[candidate_id]
