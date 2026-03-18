@@ -110,6 +110,7 @@ EVALUATION_FIELDS = [
     "companion_documents",
     # For presentation
     "template_name",
+    "box_file_id",
     "key_protective_provisions",
     "advocacy_position",
     "jurisdiction",
