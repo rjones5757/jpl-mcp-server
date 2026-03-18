@@ -1,5 +1,5 @@
 """
-JPL Template System — MCP Server (v6)
+JPL Template System — MCP Server (v7)
 
 Connects Claude to the JPL template library (Pinecone), the JPL
 formatting macro service (Azure VM), and the template ingestion
@@ -9,7 +9,8 @@ Deployed on Railway. Claude Teams connects via streamable HTTP transport.
 
 Tools:
   jpl_search_templates      — Semantic search with deduplication, metadata
-                              hydration, and enriched evaluation metadata
+                              hydration, score filtering, and enriched
+                              evaluation metadata
   jpl_get_template          — Retrieve full metadata for a specific template
   apply_jpl_formatting      — Run the JPL formatting macro on a .docx file
                               via the Azure VM macro service
@@ -18,14 +19,17 @@ Tools:
   check_pipeline_status     — Check whether the pipeline is running, idle,
                               or completed, with log tail for diagnostics
 
-Changes from v5:
-  - New tool: check_pipeline_status — hits the VM's /pipeline-status
-    endpoint so Claude can report pipeline progress without RDP access.
-  - Lazy client initialization: OpenAI and Pinecone clients are now
-    created on first tool call, not at import time. Prevents server
-    startup failures when Pinecone is temporarily unreachable (previously
-    caused Railway boot loops with ConnectTimeoutError).
-  - All other tools unchanged from v5.
+Changes from v6:
+  - Search quality controls: score floor (0.50 minimum cosine similarity)
+    filters out noise before results reach Claude. Count cap (20 max
+    deduplicated results) prevents overwhelming context.
+  - Score-enriched results: each result now includes rank position and
+    score_gap_to_next so Claude can read the score distribution.
+    Response includes a score_summary header (top/bottom/spread/count)
+    for quick calibration.
+  - below_score_floor count in response tells Claude how many results
+    were filtered, supporting gap detection ("12 results were below
+    the relevance threshold").
 
 Dependencies (requirements.txt):
   - mcp>=1.0.0
@@ -72,6 +76,10 @@ BOX_SKILLS_FOLDER = "365569381705"
 
 # Timeout for the macro API call
 MACRO_API_TIMEOUT = 120  # seconds
+
+# Search quality controls
+SEARCH_SCORE_FLOOR = 0.50   # Minimum cosine similarity — results below this are noise
+SEARCH_MAX_RESULTS = 20     # Maximum deduplicated results returned to Claude
 
 # ---------------------------------------------------------------------------
 # Evaluation metadata fields — the subset Claude needs for intelligent triage.
@@ -372,6 +380,15 @@ async def jpl_search_templates(
     (each template appears once regardless of how many vectors matched), with
     ENRICHED metadata for intelligent evaluation.
 
+    QUALITY CONTROLS:
+      - Score floor: Results below 0.50 cosine similarity are filtered out
+        (they are noise at that distance). The response reports how many
+        were filtered so you can detect library gaps.
+      - Count cap: Maximum 20 deduplicated results returned.
+      - Each result includes rank, score, and score_gap_to_next so you can
+        read the distribution shape (cluster vs. gradual falloff vs. one
+        clear winner).
+
     Args:
         query: Natural language description of the legal scenario or
                document need.
@@ -382,7 +399,8 @@ async def jpl_search_templates(
         include_full_metadata: If true, return ALL metadata fields.
 
     Returns:
-        JSON object with unique_template_count and deduplicated results.
+        JSON object with score_summary, unique_template_count,
+        below_score_floor count, and deduplicated ranked results.
     """
     try:
         embed_response = _get_openai_client().embeddings.create(
@@ -416,12 +434,43 @@ async def jpl_search_templates(
         deduplicated = _deduplicate_results(raw_matches)
         deduplicated = _hydrate_metadata(deduplicated)
 
-        logger.info("After dedup: %d unique templates from %d raw matches",
-                     len(deduplicated), len(raw_matches))
+        # --- Score floor: discard results below minimum similarity ---
+        pre_floor_count = len(deduplicated)
+        deduplicated = [
+            e for e in deduplicated
+            if e["best_score"] >= SEARCH_SCORE_FLOOR
+        ]
+        filtered_out = pre_floor_count - len(deduplicated)
 
+        # --- Count cap: limit returned results ---
+        capped = len(deduplicated) > SEARCH_MAX_RESULTS
+        deduplicated = deduplicated[:SEARCH_MAX_RESULTS]
+
+        logger.info(
+            "Search: %d raw → %d deduped → %d after floor (%.2f) → %d returned%s",
+            len(raw_matches), pre_floor_count, len(deduplicated),
+            SEARCH_SCORE_FLOOR, len(deduplicated),
+            " (capped)" if capped else "",
+        )
+
+        if not deduplicated:
+            return json.dumps({
+                "unique_template_count": 0,
+                "raw_match_count": len(raw_matches),
+                "below_score_floor": filtered_out,
+                "results": [],
+                "message": (
+                    f"No templates scored above the {SEARCH_SCORE_FLOOR} "
+                    f"relevance threshold. {filtered_out} result(s) were "
+                    f"below the floor."
+                ),
+            })
+
+        # --- Build results with rank and score gaps ---
         formatted_results = []
-        for entry in deduplicated:
+        for rank, entry in enumerate(deduplicated, start=1):
             metadata = entry["metadata"]
+            score = round(entry["best_score"], 4)
 
             if include_full_metadata:
                 result_metadata = {
@@ -431,17 +480,37 @@ async def jpl_search_templates(
             else:
                 result_metadata = _extract_evaluation_metadata(metadata)
 
+            # Gap to the next result (0.0 for the last one)
+            if rank < len(deduplicated):
+                next_score = deduplicated[rank]["best_score"]
+                gap = round(score - next_score, 4)
+            else:
+                gap = 0.0
+
             result = {
-                "score": round(entry["best_score"], 4),
+                "rank": rank,
+                "score": score,
+                "score_gap_to_next": gap,
                 "template_id": entry["template_id"],
                 "match_types": entry["match_types"],
                 **result_metadata,
             }
             formatted_results.append(result)
 
+        # --- Score summary for quick calibration ---
+        scores = [r["score"] for r in formatted_results]
+        score_summary = {
+            "top_score": scores[0],
+            "bottom_score": scores[-1],
+            "score_spread": round(scores[0] - scores[-1], 4),
+            "count": len(scores),
+        }
+
         return json.dumps({
             "unique_template_count": len(formatted_results),
             "raw_match_count": len(raw_matches),
+            "below_score_floor": filtered_out,
+            "score_summary": score_summary,
             "results": formatted_results,
         })
 
@@ -782,7 +851,7 @@ async def run_template_pipeline() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool: Check Pipeline Status (NEW in v6)
+# Tool: Check Pipeline Status
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -880,5 +949,5 @@ app = mcp.streamable_http_app()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info("Starting JPL Template MCP server v6 on 0.0.0.0:%d", port)
+    logger.info("Starting JPL Template MCP server v7 on 0.0.0.0:%d", port)
     uvicorn.run(app, host="0.0.0.0", port=port)
