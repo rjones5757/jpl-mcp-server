@@ -3,4 +3,3 @@ openai>=1.0.0
 pinecone>=3.0.0
 uvicorn>=0.24.0
 httpx>=0.25.0
-box-sdk-gen

@@ -12,8 +12,6 @@ Tools:
                               hydration, score filtering, and enriched
                               evaluation metadata
   jpl_get_template          — Retrieve full metadata for a specific template
-  apply_jpl_formatting      — Run the JPL formatting macro on a .docx file
-                              via the Azure VM macro service
   run_template_pipeline     — Trigger the template ingestion pipeline on
                               the Azure VM (hopper mode)
   check_pipeline_status     — Check whether the pipeline is running, idle,
@@ -37,15 +35,11 @@ Dependencies (requirements.txt):
   - pinecone>=3.0.0
   - uvicorn>=0.24.0
   - httpx>=0.25.0
-  - box-sdk-gen
 """
 
 import os
-import io
 import json
 import logging
-import tempfile
-from pathlib import Path
 
 import httpx
 import uvicorn
@@ -61,21 +55,11 @@ from pinecone import Pinecone
 EMBEDDING_MODEL = "text-embedding-3-large"
 PINECONE_INDEX = "jpl-templates"
 
-# Macro API on the Azure VM
-VM_MACRO_URL = os.environ.get("VM_MACRO_URL", "")       # e.g. http://<VM-IP>:8443/format
+# VM API on the Azure VM
 VM_MACRO_API_KEY = os.environ.get("VM_MACRO_API_KEY", "")
 
-# Pipeline trigger on the Azure VM (same server as macro, different endpoint)
+# Pipeline trigger on the Azure VM
 VM_PIPELINE_URL = os.environ.get("VM_PIPELINE_URL", "")  # e.g. http://<VM-IP>:8443/run-pipeline
-
-# Box JWT config — stored as a JSON string in the Railway env var
-BOX_JWT_CONFIG = os.environ.get("BOX_JWT_CONFIG", "")
-
-# Box folder for macro output
-BOX_SKILLS_FOLDER = "365569381705"
-
-# Timeout for the macro API call
-MACRO_API_TIMEOUT = 120  # seconds
 
 # Search quality controls
 SEARCH_SCORE_FLOOR = 0.50   # Minimum cosine similarity — results below this are noise
@@ -136,7 +120,6 @@ logger = logging.getLogger(__name__)
 
 _openai_client = None
 _pinecone_index = None
-_box_client = None
 
 
 def _get_openai_client():
@@ -156,68 +139,6 @@ def _get_pinecone_index():
         _pinecone_index = pc.Index(PINECONE_INDEX)
         logger.info("Pinecone index '%s' connected", PINECONE_INDEX)
     return _pinecone_index
-
-
-def _get_box_client():
-    """Create or return the cached Box client."""
-    global _box_client
-    if _box_client is not None:
-        return _box_client
-
-    if not BOX_JWT_CONFIG:
-        raise RuntimeError(
-            "BOX_JWT_CONFIG environment variable is not set. "
-            "Cannot connect to Box for file operations."
-        )
-
-    from box_sdk_gen import BoxClient, BoxJWTAuth, JWTConfig
-
-    jwt_config = JWTConfig.from_config_json_string(BOX_JWT_CONFIG)
-    auth = BoxJWTAuth(config=jwt_config)
-    _box_client = BoxClient(auth=auth)
-
-    user = _box_client.users.get_user_me()
-    logger.info("Box client initialized (authenticated as: %s)", user.name)
-    return _box_client
-
-
-def _box_download_file(file_id: str) -> tuple[bytes, str]:
-    """Download a file from Box. Returns (content_bytes, filename)."""
-    client = _get_box_client()
-    file_info = client.files.get_file_by_id(file_id)
-    content = client.downloads.download_file(file_id).read()
-    return content, file_info.name
-
-
-def _box_upload_file(content: bytes, filename: str, folder_id: str) -> str:
-    """Upload a file to Box. Returns the new file's ID."""
-    from box_sdk_gen import UploadFileAttributes, UploadFileAttributesParentField
-
-    client = _get_box_client()
-    attrs = UploadFileAttributes(
-        name=filename,
-        parent=UploadFileAttributesParentField(id=folder_id),
-    )
-    uploaded = client.uploads.upload_file(attrs, io.BytesIO(content))
-    return uploaded.entries[0].id
-
-
-def _box_find_or_create_subfolder(parent_folder_id: str, folder_name: str) -> str:
-    """Find a subfolder by name, or create it. Returns the folder ID."""
-    from box_sdk_gen import CreateFolderParent
-
-    client = _get_box_client()
-    items = client.folders.get_folder_items(parent_folder_id)
-    for entry in items.entries:
-        if entry.type == "folder" and entry.name == folder_name:
-            return entry.id
-
-    folder = client.folders.create_folder(
-        name=folder_name,
-        parent=CreateFolderParent(id=parent_folder_id),
-    )
-    logger.info("Created Box folder '%s' (ID: %s)", folder_name, folder.id)
-    return folder.id
 
 
 # ---------------------------------------------------------------------------
@@ -575,166 +496,6 @@ async def jpl_get_template(template_id: str) -> str:
         logger.error("Fetch error: %s", e, exc_info=True)
         return json.dumps({
             "error": f"Failed to retrieve template: {e}",
-        })
-
-
-# ---------------------------------------------------------------------------
-# Tool: Apply JPL Formatting (macro-as-a-service)
-# ---------------------------------------------------------------------------
-
-@mcp.tool(
-    name="apply_jpl_formatting",
-    annotations={
-        "title": "Apply JPL Formatting Macro",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-async def apply_jpl_formatting(
-    file_content_base64: str = "",
-    filename: str = "document.docx",
-    box_file_id: str = "",
-    output_folder_id: str = "",
-) -> str:
-    """Apply the JPL formatting macro to a .docx file.
-
-    TWO MODES — use one:
-
-    Mode 1 (PREFERRED for chat sessions): Pass file_content_base64.
-    Mode 2 (for pipeline/Box workflows): Pass box_file_id.
-
-    Args:
-        file_content_base64: Base64-encoded .docx file content.
-        filename: Filename for the document (default: document.docx).
-        box_file_id: Box file ID of the .docx to format.
-        output_folder_id: (Box mode only) Box folder ID for the result.
-
-    Returns:
-        JSON with status and formatted file (base64 or Box file ID).
-    """
-    import base64
-    from datetime import datetime as dt
-
-    if not VM_MACRO_URL:
-        return json.dumps({
-            "error": "Macro service not configured.",
-            "detail": "VM_MACRO_URL environment variable is not set on the MCP server.",
-            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
-        })
-
-    if not file_content_base64 and not box_file_id:
-        return json.dumps({
-            "error": "No file provided. Supply either file_content_base64 or box_file_id.",
-        })
-
-    try:
-        if file_content_base64:
-            mode = "direct"
-            try:
-                file_content = base64.b64decode(file_content_base64)
-            except Exception as e:
-                return json.dumps({"error": f"Invalid base64 content: {e}"})
-            if not filename.lower().endswith(".docx"):
-                filename = filename + ".docx"
-            logger.info("apply_jpl_formatting (direct mode): %s (%s bytes)",
-                        filename, f"{len(file_content):,}")
-        else:
-            mode = "box"
-            logger.info("apply_jpl_formatting (box mode): downloading Box file %s", box_file_id)
-            file_content, filename = _box_download_file(box_file_id)
-            if not filename.lower().endswith(".docx"):
-                return json.dumps({
-                    "error": f"File '{filename}' is not a .docx file.",
-                    "detail": "The macro service only accepts .docx files.",
-                })
-            logger.info("  Downloaded: %s (%s bytes)", filename, f"{len(file_content):,}")
-
-        logger.info("  Sending to macro service: %s", VM_MACRO_URL)
-
-        headers = {}
-        if VM_MACRO_API_KEY:
-            headers["Authorization"] = f"Bearer {VM_MACRO_API_KEY}"
-
-        async with httpx.AsyncClient(timeout=MACRO_API_TIMEOUT) as client:
-            response = await client.post(
-                VM_MACRO_URL,
-                files={"file": (filename, file_content, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
-                headers=headers,
-            )
-
-        if response.status_code != 200:
-            error_detail = response.text[:500] if response.text else "No response body"
-            logger.error("  Macro service returned %d: %s", response.status_code, error_detail)
-            return json.dumps({
-                "error": f"Macro service returned HTTP {response.status_code}.",
-                "detail": error_detail,
-                "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
-            })
-
-        formatted_content = response.content
-        logger.info("  Macro service returned formatted file (%s bytes)", f"{len(formatted_content):,}")
-
-        if mode == "direct":
-            formatted_base64 = base64.b64encode(formatted_content).decode("ascii")
-            return json.dumps({
-                "status": "success",
-                "mode": "direct",
-                "formatted_file_base64": formatted_base64,
-                "filename": filename,
-            })
-        else:
-            dest_folder = output_folder_id
-            if not dest_folder:
-                dest_folder = _box_find_or_create_subfolder(BOX_SKILLS_FOLDER, "Macro Output")
-
-            stem = Path(filename).stem
-            timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
-            formatted_filename = f"{stem}_formatted_{timestamp}.docx"
-
-            logger.info("  Uploading formatted file to Box folder %s as '%s'", dest_folder, formatted_filename)
-            new_file_id = _box_upload_file(formatted_content, formatted_filename, dest_folder)
-            logger.info("  Upload complete. New Box file ID: %s", new_file_id)
-
-            return json.dumps({
-                "status": "success",
-                "mode": "box",
-                "formatted_file_id": new_file_id,
-                "formatted_filename": formatted_filename,
-                "original_file_id": box_file_id,
-                "original_filename": filename,
-                "output_folder_id": dest_folder,
-            })
-
-    except RuntimeError as e:
-        logger.error("apply_jpl_formatting config error: %s", e)
-        return json.dumps({
-            "error": str(e),
-            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
-        })
-
-    except httpx.TimeoutException:
-        logger.error("apply_jpl_formatting: macro service timed out after %ds", MACRO_API_TIMEOUT)
-        return json.dumps({
-            "error": f"Macro service timed out after {MACRO_API_TIMEOUT} seconds.",
-            "detail": "The VM may be processing another document or may be offline.",
-            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
-        })
-
-    except httpx.ConnectError as e:
-        logger.error("apply_jpl_formatting: cannot reach macro service at %s: %s", VM_MACRO_URL, e)
-        return json.dumps({
-            "error": "Cannot reach the macro service.",
-            "detail": f"Connection to {VM_MACRO_URL} failed. The VM may be offline.",
-            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
-        })
-
-    except Exception as e:
-        logger.error("apply_jpl_formatting unexpected error: %s", e, exc_info=True)
-        return json.dumps({
-            "error": f"Unexpected error: {e}",
-            "fallback": "Instruct the user to download the .docx and run the JPL Format macro manually in Word.",
         })
 
 
