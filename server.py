@@ -1,5 +1,5 @@
 """
-JPL Template System — MCP Server (v7)
+JPL Template System — MCP Server (v8)
 
 Connects Claude to the JPL template library (Pinecone), the JPL
 formatting macro service (Azure VM), and the template ingestion
@@ -14,20 +14,16 @@ Tools:
   jpl_get_template          — Retrieve full metadata for a specific template
   run_template_pipeline     — Trigger the template ingestion pipeline on
                               the Azure VM (hopper mode)
+  run_library_scan          — Scan the template library for unindexed
+                              files and catalog-index them
   check_pipeline_status     — Check whether the pipeline is running, idle,
                               or completed, with log tail for diagnostics
 
-Changes from v6:
-  - Search quality controls: score floor (0.50 minimum cosine similarity)
-    filters out noise before results reach Claude. Count cap (20 max
-    deduplicated results) prevents overwhelming context.
-  - Score-enriched results: each result now includes rank position and
-    score_gap_to_next so Claude can read the score distribution.
-    Response includes a score_summary header (top/bottom/spread/count)
-    for quick calibration.
-  - below_score_floor count in response tells Claude how many results
-    were filtered, supporting gap detection ("12 results were below
-    the relevance threshold").
+Changes from v7:
+  - New tool: run_library_scan — triggers the library scan on the Azure VM
+    to find and catalog-index any unindexed files in the template library.
+    Supports JPL-Approved template deposits, periodic integrity checks,
+    and recovery from interrupted pipeline runs.
 
 Dependencies (requirements.txt):
   - mcp>=1.0.0
@@ -142,7 +138,7 @@ def _get_pinecone_index():
 
 
 # ---------------------------------------------------------------------------
-# VM API helper — derive status URL from pipeline URL
+# VM API helpers — derive URLs from pipeline URL
 # ---------------------------------------------------------------------------
 
 def _get_pipeline_status_url() -> str:
@@ -154,6 +150,13 @@ def _get_pipeline_status_url() -> str:
     if not VM_PIPELINE_URL:
         return ""
     return VM_PIPELINE_URL.replace("/run-pipeline", "/pipeline-status")
+
+
+def _get_library_scan_url() -> str:
+    """Derive the /run-library-scan URL from VM_PIPELINE_URL."""
+    if not VM_PIPELINE_URL:
+        return ""
+    return VM_PIPELINE_URL.replace("/run-pipeline", "/run-library-scan")
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +616,117 @@ async def run_template_pipeline() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool: Run Library Scan
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="run_library_scan",
+    annotations={
+        "title": "Run Library Scan",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def run_library_scan() -> str:
+    """Scan the JPL template library for unindexed files and index them.
+
+    This runs the pipeline in library-scan mode — it walks the entire
+    template library in Box, compares against Pinecone, and catalog-indexes
+    any files that don't have vectors yet. No transformation — just
+    analysis, metadata extraction, and embedding generation.
+
+    Use this for:
+      - Periodic integrity checks (are all library files indexed?)
+      - After manually placing files in the library (e.g., JPL-Approved
+        templates deposited by the Managing Attorney)
+      - After any suspected pipeline interruption between Box upload
+        and Pinecone indexing
+
+    Typical time: 1-2 minutes for a clean scan (all files already indexed),
+    5-10 minutes per newly discovered file that needs catalog indexing.
+
+    Returns:
+        JSON with trigger status:
+        - "triggered": Library scan started. It will check all files in
+          the template library against Pinecone and index any gaps.
+        - "already_running": A pipeline run is already in progress.
+          Wait for it to finish before scanning.
+        - "error": Something went wrong. Show the error and offer the
+          manual fallback: run `py pipeline_v3.py --library-scan` on the VM.
+    """
+    scan_url = _get_library_scan_url()
+
+    if not scan_url:
+        return json.dumps({
+            "error": "Library scan not configured.",
+            "detail": "VM_PIPELINE_URL environment variable is not set on the MCP server.",
+            "fallback": "Run the scan manually on the VM: py pipeline_v3.py --library-scan",
+        })
+
+    try:
+        headers = {}
+        if VM_MACRO_API_KEY:
+            headers["Authorization"] = f"Bearer {VM_MACRO_API_KEY}"
+
+        logger.info("run_library_scan: triggering %s", scan_url)
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(scan_url, headers=headers)
+
+        if response.status_code == 409:
+            data = response.json()
+            logger.info("run_library_scan: already running (%s)", data.get("started_at"))
+            return json.dumps({
+                "status": "already_running",
+                "message": data.get("message", "Pipeline is already running."),
+                "started_at": data.get("started_at"),
+                "elapsed_seconds": data.get("elapsed_seconds"),
+            })
+
+        if response.status_code != 200:
+            error_detail = response.text[:500] if response.text else "No response body"
+            logger.error("run_library_scan: VM returned %d: %s", response.status_code, error_detail)
+            return json.dumps({
+                "error": f"VM returned HTTP {response.status_code}.",
+                "detail": error_detail,
+                "fallback": "Run the scan manually on the VM: py pipeline_v3.py --library-scan",
+            })
+
+        data = response.json()
+        logger.info("run_library_scan: triggered (PID %s)", data.get("pid"))
+        return json.dumps({
+            "status": "triggered",
+            "message": data.get("message", "Library scan started."),
+            "started_at": data.get("started_at"),
+        })
+
+    except httpx.ConnectError as e:
+        logger.error("run_library_scan: cannot reach VM at %s: %s", scan_url, e)
+        return json.dumps({
+            "error": "Cannot reach the VM.",
+            "detail": f"Connection to {scan_url} failed. The VM may be offline or the port may not be open.",
+            "fallback": "Run the scan manually on the VM: py pipeline_v3.py --library-scan",
+        })
+
+    except httpx.TimeoutException:
+        logger.error("run_library_scan: request to VM timed out")
+        return json.dumps({
+            "error": "Request to VM timed out after 30 seconds.",
+            "detail": "The VM may be offline or unresponsive.",
+            "fallback": "Run the scan manually on the VM: py pipeline_v3.py --library-scan",
+        })
+
+    except Exception as e:
+        logger.error("run_library_scan unexpected error: %s", e, exc_info=True)
+        return json.dumps({
+            "error": f"Unexpected error: {e}",
+            "fallback": "Run the scan manually on the VM: py pipeline_v3.py --library-scan",
+        })
+
+
+# ---------------------------------------------------------------------------
 # Tool: Check Pipeline Status
 # ---------------------------------------------------------------------------
 
@@ -711,5 +825,5 @@ app = mcp.streamable_http_app()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info("Starting JPL Template MCP server v7 on 0.0.0.0:%d", port)
+    logger.info("Starting JPL Template MCP server v8 on 0.0.0.0:%d", port)
     uvicorn.run(app, host="0.0.0.0", port=port)
