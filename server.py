@@ -95,6 +95,9 @@ EVALUATION_FIELDS = [
     "advocacy_position",
     "jurisdiction",
     "property_type",
+    # Companion text system — plain-text .md mirror for .dotx reading
+    "companion_text_box_id",
+    "companion_text_instruction",
 ]
 
 logging.basicConfig(
